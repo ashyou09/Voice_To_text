@@ -1,0 +1,10 @@
+faster-whisper>=1.1
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart
+python-dotenv
+httpx
+fpdf2>=2.8
+uharfbuzz
+yt-dlp
+av>=14,<17   # newer PyAV removed an option faster-whisper uses
