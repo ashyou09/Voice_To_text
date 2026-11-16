@@ -184,8 +184,8 @@ async function route() {
 window.addEventListener("hashchange", route);
 
 function showLogin() {
-  $("#view").innerHTML = `<div class="card login"><h1>VoxScribe</h1><p class="sub">This app is protected. Enter the password.</p>
-    <form id="loginf"><input type="password" id="pwin" class="url" placeholder="Password" autofocus>
+  $("#view").innerHTML = `<div class="card login"><h1>VoxScribe</h1><p class="sub">This demo is protected. Password: <strong style="color:var(--text);font-weight:600">Student</strong></p>
+    <form id="loginf"><input type="text" id="pwin" class="url" value="Student" placeholder="Password" autofocus>
     <button class="btn primary" style="margin-top:12px;width:100%;justify-content:center">Open</button></form><p class="sub" id="loginerr" style="color:var(--danger)"></p></div>`;
   $("#loginf").onsubmit = async e => {
     e.preventDefault(); try { localStorage.setItem(PW_KEY, $("#pwin").value); } catch {}
