@@ -20,13 +20,30 @@ class AIError(Exception):
     pass
 
 
+OPENROUTER = "https://openrouter.ai/api/v1"
+GROQ = "https://api.groq.com/openai/v1"
+
+
+def _groq_default() -> bool:
+    """With only GROQ_API_KEY set, use Groq's free LLMs too, so one key runs the whole app."""
+    return (not os.getenv("AI_BASE_URL") and not os.getenv("AI_API_KEY")
+            and not os.getenv("OPENROUTER_API_KEY") and bool(os.getenv("GROQ_API_KEY")))
+
+
 def base_url() -> str:
-    """Any OpenAI-compatible server works: OpenRouter (default), a local proxy, LM Studio, Ollama, ..."""
-    return os.getenv("AI_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+    """Any OpenAI-compatible server works: OpenRouter, Groq, a local proxy, LM Studio, Ollama, ..."""
+    return (os.getenv("AI_BASE_URL") or (GROQ if _groq_default() else OPENROUTER)).rstrip("/")
+
+
+def is_openrouter() -> bool:
+    return "openrouter.ai" in base_url()
 
 
 def api_key() -> str:
-    return os.getenv("AI_API_KEY") or os.getenv("OPENROUTER_API_KEY") or ""
+    key = os.getenv("AI_API_KEY") or os.getenv("OPENROUTER_API_KEY") or ""
+    if not key and "api.groq.com" in base_url():
+        key = os.getenv("GROQ_API_KEY", "")
+    return key
 
 
 def is_local() -> bool:
@@ -40,8 +57,9 @@ def enabled() -> bool:
 
 
 # Used when AI_MODEL=auto (or unset on a local server): first match wins.
-PREFERRED = ["gemini", "gpt-oss", "llama-3.3", "llama-4", "qwen", "deepseek", "glm", "mistral", "llama", "gemma"]
-SKIP = ("embed", "whisper", "tts", "image", "rerank", "moderation", "audio", "vision-only", "dall", "flux", "sdxl")
+PREFERRED = ["gemini", "gpt-oss-120b", "gpt-oss", "llama-3.3", "llama-4", "qwen", "deepseek", "glm", "mistral", "llama", "gemma"]
+SKIP = ("embed", "whisper", "tts", "image", "rerank", "moderation", "audio", "vision-only", "dall", "flux", "sdxl",
+        "guard", "orpheus", "compound")
 _picked: dict[str, str] = {}
 
 
@@ -82,7 +100,7 @@ def _auto_pick() -> str:
     """Local server: ask which models it offers and choose a good chat model."""
     if base_url() in _picked:
         return _picked[base_url()]
-    if not is_local():
+    if is_openrouter():
         return _free_models()[0]
     headers = {"Authorization": f"Bearer {api_key()}"} if api_key() else {}
     try:
@@ -107,7 +125,7 @@ def _auto_pick() -> str:
 
 def _configured_model() -> str:
     m = os.getenv("AI_MODEL", "").strip()
-    if not m and not is_local():
+    if not m and is_openrouter():
         m = os.getenv("OPENROUTER_MODEL", "").strip()  # legacy setting, hosted OpenRouter only
     return m or "auto"
 
@@ -123,14 +141,14 @@ def model_label() -> str:
     m = _configured_model()
     if m != "auto":
         return m
-    return _picked.get(base_url(), "auto-selected model") if is_local() else "free models (auto)"
+    return "free models (auto)" if is_openrouter() else _picked.get(base_url(), "auto-selected model")
 
 
 def _candidates() -> list[str]:
     m = _configured_model()
     if m != "auto":
         return [m]
-    if is_local():
+    if not is_openrouter():
         return [_auto_pick()]
     return _free_models()[:5] + ["openrouter/free"]  # free models only; moves on if one is busy
 
@@ -229,10 +247,10 @@ def cleanup(segs: list[dict]) -> list[dict]:
     return out
 
 
-def label_speakers(segs: list[dict]) -> list[dict]:
-    """Guess who is speaking from the text alone (conversation cues). Best effort."""
+def label_speakers(segs: list[dict], prev: str = "") -> list[dict]:
+    """Guess who is speaking from the text alone (conversation cues). Best effort.
+    `prev` = speaker of the line just before these segments (when sent in batches)."""
     out = [dict(s) for s in segs]
-    prev = ""
     for start in range(0, len(segs), CHUNK):
         chunk = segs[start:start + CHUNK]
         context = f"The previous line was spoken by {prev}.\n" if prev else ""

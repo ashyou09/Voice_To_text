@@ -1,0 +1,10 @@
+.env
+.venv/
+data/
+transcripts/
+__pycache__/
+requirements-local.txt
+transcriber.py
+exporters.py
+cli.py
+Dockerfile

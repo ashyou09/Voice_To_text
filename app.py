@@ -1,268 +1,202 @@
-"""VoxScribe web app.
+"""VoxScribe server — a small, stateless API. Works on Vercel, in Docker, or on your own computer.
 
-    python app.py            -> open http://127.0.0.1:8000
+    python app.py            -> http://127.0.0.1:8000
 
-Transcription runs locally with Whisper. AI tools (summary, clean-up, speaker
-detection) use any OpenAI-compatible API configured in the .env file.
+The browser does the heavy lifting: it decodes the audio, splits it into ~2-minute chunks,
+sends them here one by one, and stores transcripts in the browser (IndexedDB).
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import shutil
 import tempfile
-import threading
-import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
 
-import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(Path(__file__).parent / ".env")
 except ImportError:
     pass
 
 import ai
-from exporters import export
-from transcriber import MODEL_SIZES, Segment, Transcript
+import stt
 
 HERE = Path(__file__).parent
-DATA = HERE / "data"
-DATA.mkdir(exist_ok=True)
+DATA = HERE / "data"  # transcripts from the older server-side version (imported into the browser)
+ON_VERCEL = bool(os.getenv("VERCEL"))
+CHUNK_SECONDS = 110  # 16 kHz mono WAV: 110 s ≈ 3.5 MB, under Vercel's 4.5 MB request limit
 
 app = FastAPI(title="VoxScribe")
-worker = ThreadPoolExecutor(max_workers=1)  # one transcription at a time (models are RAM-hungry)
-lock = threading.Lock()
 
 
-# ---------------- storage: data/<id>/meta.json + media file ----------------
-def _dir(tid: str) -> Path:
-    d = DATA / tid
-    if not d.is_dir() or "/" in tid or ".." in tid:
-        raise HTTPException(404, "Transcript not found")
-    return d
+# ---------------- optional password ----------------
+def check_password(x_app_password: str = Header("")):
+    pw = os.getenv("APP_PASSWORD", "")
+    if pw and not hmac.compare_digest(x_app_password.encode(), pw.encode()):
+        raise HTTPException(401, "Wrong or missing password")
 
 
-def load(tid: str) -> dict:
-    return json.loads((_dir(tid) / "meta.json").read_text(encoding="utf-8"))
-
-
-def save(meta: dict) -> None:
-    with lock:
-        p = DATA / meta["id"] / "meta.json"
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(p)
-
-
-def update(tid: str, **fields) -> dict:
-    meta = load(tid)
-    meta.update(fields)
-    save(meta)
-    return meta
-
-
-def to_transcript(meta: dict) -> Transcript:
-    return Transcript(
-        source_name=meta["title"],
-        language=meta.get("language") or "?",
-        language_probability=meta.get("language_probability") or 0,
-        duration=meta.get("duration") or 0,
-        segments=[Segment(s["start"], s["end"], s["text"], s.get("speaker", "")) for s in meta.get("segments", [])],
-    )
-
-
-# ---------------- background job ----------------
-def run_job(tid: str, url: Optional[str]) -> None:
-    from transcriber import transcribe  # imported here so the UI starts instantly
-
+def _link_import() -> bool:
+    if ON_VERCEL:
+        return False
     try:
-        meta = load(tid)
-        d = DATA / tid
-        if url:
-            update(tid, status="downloading")
-            media = download_link(url, d)
-            meta = update(tid, media=media.name, title=media.stem)
-        update(tid, status="transcribing", progress=0)
+        import yt_dlp  # noqa: F401
 
-        last = [0.0]
-
-        def progress(f: float):
-            if f - last[0] >= 0.02:
-                last[0] = f
-                update(tid, progress=round(f, 3))
-
-        t = transcribe(
-            str(d / meta["media"]),
-            model_size=meta["model"],
-            language=meta["language_requested"] or None,
-            task="translate" if meta["translate"] else "transcribe",
-            source_name=meta["title"],
-            on_progress=progress,
-        )
-        update(
-            tid,
-            status="done",
-            progress=1,
-            language=t.language,
-            language_probability=t.language_probability,
-            duration=t.duration,
-            segments=[{"start": s.start, "end": s.end, "text": s.text, "speaker": ""} for s in t.segments],
-        )
-    except Exception as e:  # show the error in the UI instead of failing silently
-        update(tid, status="error", error=f"{type(e).__name__}: {e}")
+        return True
+    except ImportError:
+        return False
 
 
-def download_link(url: str, out_dir: Path) -> Path:
-    import yt_dlp
+def _legacy_ids() -> list[str]:
+    if ON_VERCEL or not DATA.is_dir():
+        return []
+    return sorted(d.name for d in DATA.iterdir() if (d / "meta.json").is_file())
 
-    opts = {"format": "bestaudio/best", "outtmpl": str(out_dir / "%(title).80s.%(ext)s"), "quiet": True,
-            "noplaylist": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return Path(ydl.prepare_filename(info))
+
+# ---------------- pages ----------------
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def index():
+    page = HERE / "public" / "index.html"
+    if page.is_file():
+        return page.read_text(encoding="utf-8")
+    return RedirectResponse("/index.html")  # on Vercel, public/ is served by the CDN
+
+
+@app.get("/app.js", include_in_schema=False)
+def app_js():  # on Vercel this file is served straight from public/ by the CDN
+    return FileResponse(HERE / "public" / "app.js", media_type="text/javascript")
 
 
 # ---------------- API ----------------
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return (HERE / "static" / "index.html").read_text(encoding="utf-8")
-
-
 @app.get("/api/config")
 def config():
-    return {"models": MODEL_SIZES, "ai_enabled": ai.enabled(), "ai_model": ai.model_label()}
-
-
-@app.post("/api/transcriptions")
-async def create(
-    file: Optional[UploadFile] = File(None),
-    url: str = Form(""),
-    language: str = Form(""),
-    model: str = Form("small"),
-    translate: bool = Form(False),
-):
-    if not file and not url.strip():
-        raise HTTPException(400, "Upload a file or paste a link")
-    if model not in MODEL_SIZES:
-        raise HTTPException(400, "Unknown model")
-    tid = uuid.uuid4().hex[:12]
-    d = DATA / tid
-    d.mkdir()
-    meta = {
-        "id": tid, "created": time.time(), "status": "queued", "progress": 0, "error": "",
-        "title": "Link import" if not file else Path(file.filename or "recording").stem,
-        "media": "", "model": model, "language_requested": language, "translate": translate,
-        "language": "", "language_probability": 0, "duration": 0, "segments": [], "summary": "",
+    return {
+        "engine": stt.engine(),
+        "models": stt.models(),
+        "default_model": stt.default_model(),
+        "chunk_seconds": CHUNK_SECONDS,
+        "ai_enabled": ai.enabled(),
+        "ai_model": ai.model_label(),
+        "link_import": _link_import(),
+        "auth_required": bool(os.getenv("APP_PASSWORD")),
+        "legacy": len(_legacy_ids()),
     }
-    if file:
-        name = "media" + (Path(file.filename or "").suffix.lower() or ".webm")
-        with open(d / name, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        meta["media"] = name
-    save(meta)
-    worker.submit(run_job, tid, url.strip() or None)
-    return meta
 
 
-@app.get("/api/transcriptions")
-def list_all():
-    items = []
-    for d in DATA.iterdir():
-        try:
-            m = json.loads((d / "meta.json").read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        m.pop("segments", None)
-        m.pop("summary", None)
-        items.append(m)
-    return sorted(items, key=lambda m: m["created"], reverse=True)
-
-
-@app.get("/api/transcriptions/{tid}")
-def get_one(tid: str):
-    return load(tid)
-
-
-class Edit(BaseModel):
-    title: Optional[str] = None
-    segments: Optional[list[dict]] = None
-    summary: Optional[str] = None
-
-
-@app.put("/api/transcriptions/{tid}")
-def edit(tid: str, body: Edit):
-    fields = {k: v for k, v in body.model_dump().items() if v is not None}
-    return update(tid, **fields)
-
-
-@app.delete("/api/transcriptions/{tid}")
-def delete(tid: str):
-    shutil.rmtree(_dir(tid))
+@app.post("/api/login", dependencies=[Depends(check_password)])
+def login():
     return {"ok": True}
 
 
-@app.get("/api/transcriptions/{tid}/media")
-def media(tid: str):
-    meta = load(tid)
-    if not meta.get("media"):
-        raise HTTPException(404, "No media yet")
-    return FileResponse(_dir(tid) / meta["media"])
+@app.post("/api/transcribe", dependencies=[Depends(check_password)])
+async def transcribe(
+    file: UploadFile = File(...),
+    language: str = Form(""),
+    model: str = Form(""),
+    task: str = Form("transcribe"),
+    detect: bool = Form(False),
+):
+    audio = await file.read()
+    if not audio:
+        raise HTTPException(400, "Empty audio chunk")
+    try:
+        # run the blocking HTTP / model call off the event loop
+        from starlette.concurrency import run_in_threadpool
 
-
-@app.get("/api/transcriptions/{tid}/export")
-def export_file(tid: str, fmt: str = "md", timestamps: bool = True, summary: bool = True):
-    meta = load(tid)
-    if fmt not in ("txt", "md", "pdf", "srt"):
-        raise HTTPException(400, "Format must be txt, md, pdf or srt")
-    t = to_transcript(meta)
-    out = Path(tempfile.mkdtemp(prefix="voxscribe_"))
-    path = export(t, [fmt], str(out), timestamps, summary=meta.get("summary", "") if summary else "")[0]
-    media_types = {"txt": "text/plain", "md": "text/markdown", "pdf": "application/pdf", "srt": "application/x-subrip"}
-    return FileResponse(path, media_type=media_types[fmt], filename=f"{meta['title']}.{fmt}")
+        return await run_in_threadpool(
+            stt.transcribe_chunk, audio, model, language or None, "translate" if task == "translate" else "transcribe", detect
+        )
+    except stt.STTError as e:
+        headers = {"Retry-After": str(int(e.retry_after))} if e.retry_after else None
+        return JSONResponse({"detail": str(e)}, status_code=e.status, headers=headers)
 
 
 class AIRequest(BaseModel):
     action: str  # summary | cleanup | speakers
+    segments: list[dict]
+    prev: str = ""
 
 
-@app.post("/api/transcriptions/{tid}/ai")
-def run_ai(tid: str, body: AIRequest):
+@app.post("/api/ai", dependencies=[Depends(check_password)])
+def run_ai(body: AIRequest):
     if not ai.enabled():
-        raise HTTPException(400, "Set AI_BASE_URL / AI_API_KEY in the .env file to use AI tools")
-    meta = load(tid)
-    segs = meta.get("segments", [])
-    if not segs:
+        raise HTTPException(400, "AI tools are off. Set an AI key (see README).")
+    if not body.segments:
         raise HTTPException(400, "Transcript is empty")
+    if len(body.segments) > 120 and body.action != "summary":
+        raise HTTPException(400, "Send at most 120 segments per request")
     try:
         if body.action == "summary":
-            return update(tid, summary=ai.summarize(segs))
+            return {"summary": ai.summarize(body.segments)}
         if body.action == "cleanup":
-            return update(tid, segments=ai.cleanup(segs))
+            return {"segments": ai.cleanup(body.segments)}
         if body.action == "speakers":
-            return update(tid, segments=ai.label_speakers(segs))
+            return {"segments": ai.label_speakers(body.segments, body.prev)}
     except ai.AIError as e:
         raise HTTPException(502, str(e))
     raise HTTPException(400, "Unknown action")
 
 
-if __name__ == "__main__":
-    # Jobs left unfinished by a previous run can't resume; mark them as failed.
-    for d in DATA.iterdir():
+class LinkRequest(BaseModel):
+    url: str
+
+
+@app.post("/api/fetch-link", dependencies=[Depends(check_password)])
+def fetch_link(body: LinkRequest):
+    """Local only: download the audio of a YouTube/video link and hand it to the browser."""
+    if not _link_import():
+        raise HTTPException(400, "Link import is only available when running on your own computer.")
+    import yt_dlp
+
+    tmp = Path(tempfile.mkdtemp(prefix="voxscribe_link_"))
+    opts = {"format": "bestaudio/best", "outtmpl": str(tmp / "%(title).80s.%(ext)s"), "quiet": True, "noplaylist": True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            path = Path(ydl.prepare_filename(ydl.extract_info(body.url, download=True)))
+    except Exception as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise HTTPException(400, f"Could not download that link: {e}")
+    return FileResponse(path, filename=path.name,
+                        background=BackgroundTask(shutil.rmtree, tmp, ignore_errors=True))
+
+
+# ---- transcripts saved by the older version of this app (server-side data/ folder) ----
+@app.get("/api/legacy", dependencies=[Depends(check_password)])
+def legacy_list():
+    out = []
+    for tid in _legacy_ids():
         try:
-            m = json.loads((d / "meta.json").read_text(encoding="utf-8"))
-            if m["status"] not in ("done", "error"):
-                m.update(status="error", error="Interrupted (server restarted). Delete and try again.")
-                save(m)
+            m = json.loads((DATA / tid / "meta.json").read_text(encoding="utf-8"))
+            if m.get("status") == "done":
+                out.append(m)
         except Exception:
             pass
-    print("VoxScribe running at http://127.0.0.1:8000")
-    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("PORT", 8000)))
+    return out
+
+
+@app.get("/api/legacy/{tid}/media", dependencies=[Depends(check_password)])
+def legacy_media(tid: str):
+    if tid not in _legacy_ids():
+        raise HTTPException(404, "Not found")
+    m = json.loads((DATA / tid / "meta.json").read_text(encoding="utf-8"))
+    p = DATA / tid / (m.get("media") or "")
+    if not m.get("media") or not p.is_file():
+        raise HTTPException(404, "No media")
+    return FileResponse(p)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", 8000))
+    print(f"VoxScribe running at http://{host}:{port}  (speech engine: {stt.engine()})")
+    uvicorn.run(app, host=host, port=port)

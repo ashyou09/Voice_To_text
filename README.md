@@ -1,51 +1,79 @@
 # 🎙️ VoxScribe — audio & video → transcripts (MD · PDF · TXT · SRT)
 
-A self-hosted transcription app inspired by tools like Happy Scribe. Speech-to-text runs **locally with Whisper**
-(free, private, works offline after the first model download). Optional AI tools use **OpenRouter**.
+A transcription app inspired by Happy Scribe. Upload, record or link audio/video, get an editable
+transcript (English, Hindi and 90+ languages), then copy it or export it.
+
+**Deploy anywhere:** Vercel, any Docker host, or run it on your own computer.
+
+## How it works
+```
+Browser ── decodes audio, splits into ~2-min WAV chunks ──► /api/transcribe ──► Whisper
+   │                                                         (Groq cloud, or this computer)
+   └── stores transcripts + media in IndexedDB (nothing is saved on the server)
+```
+Because the server is stateless and tiny, it fits in a Vercel function. The heavy speech model runs on
+[Groq](https://console.groq.com) (free tier, Whisper large-v3) or locally with faster-whisper.
 
 ## Features
-- **3 ways in:** upload audio/video · record from your mic · paste a YouTube/video link
-- **English, Hindi + 90 more languages:** auto-detect or choose; "Translate to English" option
-- **Editor:** click any sentence to jump the player there, live highlight while playing, edit text inline (auto-saves),
-  rename speakers, find & replace, playback speed
-- **AI tools (OpenRouter):** summary · fix punctuation/spelling · detect speakers
-- **Export:** Markdown, PDF (Hindi supported), TXT, SRT subtitles; with/without timestamps and summary
-- File library stored locally in `data/`
+- Upload audio/video, record from the mic, or paste a link (link import: local mode only)
+- Auto language detection with an English/Hindi sanity check; "Translate to English"
+- Editor: click-to-seek, live highlight, inline editing, speakers, find & replace, playback speed
+- **Copy text** in one click, or export Markdown, PDF (via the browser, so Hindi renders perfectly), TXT, SRT
+- AI tools: summary, punctuation/spelling clean-up, speaker detection (Groq or OpenRouter free models)
+- Long files are resumable if the tab closes; optional password protection
 
-## Setup (macOS)
+## Deploy on Vercel
+1. Get a free Groq key: https://console.groq.com/keys
+2. On vercel.com: **Add New → Project → import this GitHub repo** (no build settings needed).
+3. In **Settings → Environment Variables** add:
+   - `GROQ_API_KEY` = your Groq key
+   - `APP_PASSWORD` = any password (so strangers can't use your key)
+   - optional AI: leave empty to use Groq's free LLMs, or set `AI_BASE_URL=https://openrouter.ai/api/v1` + `AI_API_KEY`
+4. Deploy. Open the URL, enter the password, transcribe.
+
+## Deploy with Docker (Render, Railway, Fly.io, Koyeb, a VPS, Hugging Face Spaces…)
 ```bash
-cd Voice_Text
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env        # then paste your OpenRouter key into .env (optional)
-python app.py               # open http://127.0.0.1:8000
+docker build -t voxscribe .
+docker run -p 8000:8000 -e GROQ_API_KEY=... -e APP_PASSWORD=... voxscribe
 ```
-The first transcription downloads the chosen Whisper model (small ≈ 0.5 GB, medium ≈ 1.5 GB), then it's cached.
+Offline Whisper inside the container instead of Groq: `docker build --build-arg LOCAL=1 -t voxscribe .`
+and run with `-e STT_ENGINE=local` (needs ~2 GB RAM).
 
-## Hindi tips
-- Pick **Hindi** as the language for Hinglish (mixed) speech. Auto-detect picks one language per file.
-- Use **Accurate (medium)** or **turbo** for Hindi. **Balanced (small)** makes more mistakes.
-- If Whisper detects Urdu, the app re-runs the file as Hindi so you get Devanagari text.
-- If Hindi is missing from PDFs, put `NotoSansDevanagari-Regular.ttf`
-  ([download](https://fonts.google.com/noto/specimen/Noto+Sans+Devanagari)) into a `fonts/` folder.
-
-## Command line
+## Run on your own computer
 ```bash
-python cli.py lecture.mp4 --lang hi --model medium --format md pdf txt
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-local.txt      # includes offline Whisper
+cp .env.example .env                        # optional: add GROQ_API_KEY to use Groq instead
+python app.py                               # http://127.0.0.1:8000
 ```
+Without `GROQ_API_KEY` it uses offline Whisper (Apple-silicon GPU is used automatically).
+Use Python 3.12 or 3.13 (3.15 isn't supported by the speech libraries yet).
+
+## Settings (environment variables)
+| Variable | What it does |
+|---|---|
+| `GROQ_API_KEY` | Groq key for cloud Whisper (and free AI tools) |
+| `STT_ENGINE` | `groq` or `local` (auto by default) |
+| `APP_PASSWORD` | Require a password to use the app |
+| `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | Any OpenAI-compatible LLM for AI tools (`AI_MODEL=auto` picks one) |
+
+## Limits to know
+- Groq free tier: about 2 hours of audio per hour, 8 hours per day.
+- Transcripts are stored **in your browser**: clearing site data deletes them; they don't sync between devices.
+- Keep the tab open while a file transcribes (you can resume if it closes).
+- The browser decodes the audio first (≈1 min per 30 min of audio); very large videos (>700 MB) won't fit.
 
 ## Project layout
 ```
-app.py            FastAPI server: jobs, library, editing, export, AI endpoints
-static/index.html the whole web UI (no build step)
-transcriber.py    Whisper wrapper
-exporters.py      md / pdf / txt / srt writers
-ai.py             OpenRouter: summary, cleanup, speaker labels
-cli.py            command-line version
-data/             your transcripts + media (git-ignored)
+app.py              FastAPI server (Vercel entrypoint): /api/transcribe, /api/ai, /api/config
+stt.py              speech engines: Groq Whisper or local faster-whisper
+ai.py               summary / clean-up / speakers via any OpenAI-compatible API
+public/             the web app (index.html + app.js)
+transcriber.py      local faster-whisper wrapper    exporters.py / cli.py  command-line tool
+vercel.json · Dockerfile · requirements.txt (server) · requirements-local.txt (+ offline Whisper)
 ```
 
-## Notes
-- AI speaker detection guesses from the text (who asks or answers), not from voices. For voice-based speaker
-  separation you'd add `pyannote.audio` later.
-- Only one file transcribes at a time; others wait in the queue.
+## Command line (local)
+```bash
+python cli.py lecture.mp4 --lang hi --model medium --format md pdf txt
+```

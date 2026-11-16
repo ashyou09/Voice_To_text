@@ -1,0 +1,7 @@
+# Everything above + offline Whisper on your own computer (not for Vercel: too big).
+-r requirements.txt
+faster-whisper>=1.1
+av>=14,<17   # newer PyAV removed an option faster-whisper uses
+fpdf2>=2.8   # cli.py PDF export
+uharfbuzz
+yt-dlp       # "From a link" import
